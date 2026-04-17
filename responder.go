@@ -19,11 +19,11 @@ const typeEnumFQDN = "_services._dns-sd._udp.local."
 // Service represents a service to be advertised via mDNS.
 type Service struct {
 	// Instance is the user-friendly name of the service instance.
-	// e.g. "My Web Server"
+	// e.g., "My Web Server"
 	Instance string
 
 	// Type is the service type in the format "_application._protocol".
-	// e.g. "_http._tcp"
+	// e.g., "_http._tcp"
 	Type string
 
 	// Domain is the DNS domain for the service.
@@ -91,6 +91,18 @@ func (s *Service) typeFQDN() string {
 type serviceState struct {
 	Service
 	attrs AttrsProvider
+}
+
+// hostFQDN returns the fully qualified domain name of the service's host.
+// Format: "<hostname>.<Domain>.".
+// Returns empty string if the hostname is not set.
+func (ss *serviceState) hostFQDN() string {
+	hostname := ss.attrs.Hostname()
+	if hostname == "" {
+		return ""
+	}
+
+	return fmt.Sprintf("%s.%s.", hostname, ss.Domain)
 }
 
 // buildProbeMessage constructs a DNS query used for conflict detection.
@@ -191,10 +203,10 @@ func (ss *serviceState) makePTRResource() *dnsmessage.Resource {
 
 func (ss *serviceState) makeSRVResource() *dnsmessage.Resource {
 	fqdn, _ := ss.fqdn()
-	host := ss.attrs.Hostname()
+	hostFQDN := ss.hostFQDN()
 	port := ss.attrs.Port()
 
-	if host == "" && port == 0 {
+	if hostFQDN == "" || port == 0 {
 		return nil
 	}
 
@@ -206,7 +218,7 @@ func (ss *serviceState) makeSRVResource() *dnsmessage.Resource {
 			TTL:   ss.TTL,
 		},
 		Body: &dnsmessage.SRVResource{
-			Target: dnsmessage.MustNewName(fmt.Sprintf("%s.local.", host)),
+			Target: dnsmessage.MustNewName(hostFQDN),
 			Port:   port,
 		},
 	}
@@ -233,16 +245,16 @@ func (ss *serviceState) makeTXTResource() *dnsmessage.Resource {
 }
 
 func (ss *serviceState) makeAResources() []*dnsmessage.Resource {
-	host := ss.attrs.Hostname()
+	hostFQDN := ss.hostFQDN()
 	addrs := ss.attrs.IPAddrs()
 
-	if host == "" || len(addrs) == 0 {
+	if hostFQDN == "" || len(addrs) == 0 {
 		return nil
 	}
 
 	var records []*dnsmessage.Resource
 	header := dnsmessage.ResourceHeader{
-		Name:  dnsmessage.MustNewName(fmt.Sprintf("%s.local.", host)),
+		Name:  dnsmessage.MustNewName(hostFQDN),
 		Type:  dnsmessage.TypeA,
 		Class: dnsmessage.ClassINET | (1 << 15), // Cache-flush
 		TTL:   ss.TTL,
@@ -261,16 +273,16 @@ func (ss *serviceState) makeAResources() []*dnsmessage.Resource {
 }
 
 func (ss *serviceState) makeAAAAResources() []*dnsmessage.Resource {
-	host := ss.attrs.Hostname()
+	hostFQDN := ss.hostFQDN()
 	addrs := ss.attrs.IPAddrs()
 
-	if host == "" || len(addrs) == 0 {
+	if hostFQDN == "" || len(addrs) == 0 {
 		return nil
 	}
 
 	var records []*dnsmessage.Resource
 	header := dnsmessage.ResourceHeader{
-		Name:  dnsmessage.MustNewName(fmt.Sprintf("%s.local.", host)),
+		Name:  dnsmessage.MustNewName(hostFQDN),
 		Type:  dnsmessage.TypeAAAA,
 		Class: dnsmessage.ClassINET | (1 << 15), // Cache-flush
 		TTL:   ss.TTL,
@@ -341,6 +353,10 @@ type Responder struct {
 	// Key format: "<Type>.<Domain>."
 	types map[string][]*serviceState
 
+	// hostnames maps host FQDN to services that claim that hostname.
+	// Key format: "<Hostname>.<Domain>."
+	hostnames map[string][]*serviceState
+
 	// probing tracks ongoing probes.
 	//Key format: "<Instance>.<Type>.<Domain>.", value is a channel closed on conflict.
 	probing map[string]chan struct{}
@@ -391,7 +407,7 @@ func ResponderWithProbeWaitTime(waitTime time.Duration) ResponderOption {
 	}
 }
 
-// ServeWithProbeRetryCount sets the number of probe packets to send.
+// ResponderWithProbeRetryCount sets the number of probe packets to send.
 // Default is 3.
 func ResponderWithProbeRetryCount(count int) ResponderOption {
 	return func(r *Responder) {
@@ -418,6 +434,7 @@ func NewResponder(options ...ResponderOption) *Responder {
 	r := &Responder{
 		services:        make(map[string]*serviceState),
 		types:           make(map[string][]*serviceState),
+		hostnames:       make(map[string][]*serviceState),
 		probing:         make(map[string]chan struct{}),
 		announceStop:    make(map[string]chan struct{}),
 		network:         IPv4,
@@ -453,6 +470,8 @@ func (r *Responder) getService(fqdn string) *serviceState {
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
 
+	fqdn = strings.ToLower(fqdn)
+
 	return r.services[fqdn]
 }
 
@@ -460,7 +479,20 @@ func (r *Responder) getServicesByType(typeFQDN string) []*serviceState {
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
 
+	typeFQDN = strings.ToLower(typeFQDN)
+
 	return r.types[typeFQDN]
+}
+
+// getServicesByHostFQDN returns all services associated with the given host FQDN.
+// The hostFQDN should be in the format "<hostname>.<Domain>." (case-insensitive).
+func (r *Responder) getServicesByHostFQDN(hostFQDN string) []*serviceState {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+
+	hostFQDN = strings.ToLower(hostFQDN)
+
+	return r.hostnames[hostFQDN]
 }
 
 // addService adds a service to the responder's internal maps.
@@ -468,16 +500,25 @@ func (r *Responder) addService(fqdn string, state *serviceState) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
+	fqdn = strings.ToLower(fqdn)
+
 	r.services[fqdn] = state
 
-	typ := state.typeFQDN()
+	typ := strings.ToLower(state.typeFQDN())
 	r.types[typ] = append(r.types[typ], state)
+
+	if hostFQDN := state.hostFQDN(); hostFQDN != "" {
+		key := strings.ToLower(hostFQDN)
+		r.hostnames[key] = append(r.hostnames[key], state)
+	}
 }
 
 // removeService removes a service from the responder's internal maps.
 func (r *Responder) removeService(fqdn string) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
+
+	fqdn = strings.ToLower(fqdn)
 
 	state, ok := r.services[fqdn]
 	if !ok {
@@ -486,7 +527,7 @@ func (r *Responder) removeService(fqdn string) {
 
 	delete(r.services, fqdn)
 
-	typ := state.typeFQDN()
+	typ := strings.ToLower(state.typeFQDN())
 
 	states := r.types[typ]
 	r.types[typ] = slices.DeleteFunc(states, func(s *serviceState) bool {
@@ -494,6 +535,18 @@ func (r *Responder) removeService(fqdn string) {
 	})
 	if len(r.types[typ]) == 0 {
 		delete(r.types, typ)
+	}
+
+	// Remove from hostnames
+	if hostFQDN := state.hostFQDN(); hostFQDN != "" {
+		key := strings.ToLower(hostFQDN)
+		hostStates := r.hostnames[key]
+		r.hostnames[key] = slices.DeleteFunc(hostStates, func(s *serviceState) bool {
+			return s == state
+		})
+		if len(r.hostnames[key]) == 0 {
+			delete(r.hostnames, key)
+		}
 	}
 }
 
@@ -514,6 +567,8 @@ func (r *Responder) Register(svc Service, provider AttrsProvider) error {
 	if err != nil {
 		return err
 	}
+
+	fqdn = strings.ToLower(fqdn)
 
 	existed := r.getService(fqdn)
 	if existed != nil {
@@ -554,6 +609,8 @@ func (r *Responder) cancelAnnounce(fqdn string) bool {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
+	fqdn = strings.ToLower(fqdn)
+
 	ch, ok := r.announceStop[fqdn]
 	if ok {
 		close(ch)
@@ -578,6 +635,8 @@ func (r *Responder) Unregister(svc Service) error {
 	if err != nil {
 		return err
 	}
+
+	fqdn = strings.ToLower(fqdn)
 
 	state := r.getService(fqdn)
 	if state == nil {
@@ -617,6 +676,8 @@ func (r *Responder) Update(svc Service, provider AttrsProvider) error {
 		return err
 	}
 
+	fqdn = strings.ToLower(fqdn)
+
 	state := r.getService(fqdn)
 	if state == nil {
 		return ErrServiceNotFound
@@ -625,8 +686,36 @@ func (r *Responder) Update(svc Service, provider AttrsProvider) error {
 	// Stop any ongoing announcements and check if it was active.
 	announcing := r.cancelAnnounce(fqdn)
 
+	providerHostFQDN := func(s Service, provider AttrsProvider) string {
+		hostname := provider.Hostname()
+		if hostname == "" {
+			return ""
+		}
+
+		return fmt.Sprintf("%s.%s.", hostname, s.Domain)
+	}
+
 	// Update both the runtime attributes and TTL.
 	r.mutex.Lock()
+	oldHostFQDN := strings.ToLower(state.hostFQDN())
+	newHostFQDN := strings.ToLower(providerHostFQDN(state.Service, provider))
+
+	// Update hostnames map if hostname changed
+	if oldHostFQDN != newHostFQDN {
+		if oldHostFQDN != "" {
+			hostStates := r.hostnames[oldHostFQDN]
+			r.hostnames[oldHostFQDN] = slices.DeleteFunc(hostStates, func(s *serviceState) bool {
+				return s == state
+			})
+			if len(r.hostnames[oldHostFQDN]) == 0 {
+				delete(r.hostnames, oldHostFQDN)
+			}
+		}
+		if newHostFQDN != "" {
+			r.hostnames[newHostFQDN] = append(r.hostnames[newHostFQDN], state)
+		}
+	}
+
 	state.attrs = provider
 	state.TTL = svc.TTL
 	r.mutex.Unlock()
@@ -706,6 +795,7 @@ func (r *Responder) Shutdown() error {
 	r.cancel = nil
 	r.services = make(map[string]*serviceState)
 	r.types = make(map[string][]*serviceState)
+	r.hostnames = make(map[string][]*serviceState)
 	r.probing = make(map[string]chan struct{})
 	r.announceStop = make(map[string]chan struct{})
 	r.mutex.Unlock()
@@ -881,7 +971,7 @@ func (r *Responder) collectRecordsForQuestion(q dnsmessage.Question) []*dnsmessa
 	name := q.Name.String()
 
 	// Service type enumeration
-	if name == typeEnumFQDN {
+	if strings.EqualFold(name, typeEnumFQDN) {
 		return r.makeEnumResources()
 	}
 
@@ -899,6 +989,22 @@ func (r *Responder) collectRecordsForQuestion(q dnsmessage.Question) []*dnsmessa
 		return ss.collectAllRecords(q.Type)
 	}
 
+	// Hostname query (e.g., "my-device.local.")
+	if q.Type == dnsmessage.TypeA || q.Type == dnsmessage.TypeAAAA || q.Type == dnsmessage.TypeALL {
+		if services := r.getServicesByHostFQDN(name); len(services) > 0 {
+			var records []*dnsmessage.Resource
+			for _, ss := range services {
+				if q.Type == dnsmessage.TypeA || q.Type == dnsmessage.TypeALL {
+					records = appendNonNil(records, ss.makeAResources()...)
+				}
+				if q.Type == dnsmessage.TypeAAAA || q.Type == dnsmessage.TypeALL {
+					records = appendNonNil(records, ss.makeAAAAResources()...)
+				}
+			}
+			return records
+		}
+	}
+
 	return nil
 }
 
@@ -911,7 +1017,8 @@ func dedupResources(rs []*dnsmessage.Resource) []*dnsmessage.Resource {
 	result := make([]*dnsmessage.Resource, 0, len(rs))
 
 	resourceKey := func(r *dnsmessage.Resource) string {
-		base := fmt.Sprintf("%s-%d", r.Header.Name.String(), r.Header.Type)
+		name := strings.ToLower(r.Header.Name.String())
+		base := fmt.Sprintf("%s-%d", name, r.Header.Type)
 
 		// Include record-specific data in the key to distinguish multiple values.
 		switch body := r.Body.(type) {
@@ -959,15 +1066,9 @@ func partitionResources(records []*dnsmessage.Resource, questions []dnsmessage.Q
 	}
 
 	for _, r := range records {
-		switch r.Header.Type {
-		case dnsmessage.TypePTR, dnsmessage.TypeSRV, dnsmessage.TypeTXT:
-			if matchesQuestion(r.Header, questions) {
-				answers = append(answers, r)
-			} else {
-				additionals = append(additionals, r)
-			}
-
-		case dnsmessage.TypeA, dnsmessage.TypeAAAA:
+		if matchesQuestion(r.Header, questions) {
+			answers = append(answers, r)
+		} else {
 			additionals = append(additionals, r)
 		}
 	}

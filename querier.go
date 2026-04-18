@@ -317,8 +317,12 @@ func (q *querier) setupConnections() error {
 	var conn *multicastConn
 
 	for _, iface := range ifaces {
-		// Only use interfaces that are up and support multicast.
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 {
+		// Only use interfaces that are up
+		//
+		// Note: net.FlagMulticast is intentionally ignored because some virtual
+		// interfaces (e.g., WireGuard) may not set this flag even though they
+		// can transmit multicast traffic.
+		if iface.Flags&net.FlagUp == 0 {
 			continue
 		}
 

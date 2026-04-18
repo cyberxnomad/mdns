@@ -331,13 +331,13 @@ func (q *querier) setupConnections() error {
 		}
 
 		// Create separate connections for IPv4 and IPv6 based on the stack preference.
-		if q.network.Has(IPv4) {
+		if q.network.has(IPv4) {
 			conn, err = createConn(&iface, IPv4, q.multicastResp)
 			if err == nil {
 				q.conns = append(q.conns, conn)
 			}
 		}
-		if q.network.Has(IPv6) {
+		if q.network.has(IPv6) {
 			conn, err = createConn(&iface, IPv6, q.multicastResp)
 			if err == nil {
 				q.conns = append(q.conns, conn)

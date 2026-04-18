@@ -827,13 +827,13 @@ func (r *Responder) setupConnections() error {
 		}
 
 		// Create separate connections for IPv4 and IPv6 based on the stack preference.
-		if r.network.Has(IPv4) {
+		if r.network.has(IPv4) {
 			conn, err = createConn(&iface, IPv4, true)
 			if err == nil {
 				r.conns = append(r.conns, conn)
 			}
 		}
-		if r.network.Has(IPv6) {
+		if r.network.has(IPv6) {
 			conn, err = createConn(&iface, IPv6, true)
 			if err == nil {
 				r.conns = append(r.conns, conn)

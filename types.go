@@ -24,6 +24,6 @@ const (
 )
 
 // Check if the stack includes the specified protocol.
-func (n NetworkStack) Has(s NetworkStack) bool {
+func (n NetworkStack) has(s NetworkStack) bool {
 	return (n&s != 0)
 }
